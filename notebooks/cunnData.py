@@ -1,4 +1,5 @@
 import cupy as cp
+import cupyx as cpx
 import cudf
 import cugraph
 import anndata
@@ -9,6 +10,8 @@ import scipy
 import math
 from scipy import sparse
 from typing import Any, Union, Optional
+
+import warnings
 
 from cuml.linear_model import LinearRegression
 
@@ -41,8 +44,8 @@ class cunnData:
                 genes = cudf.Series(var.index)
                 self.obs = obs
                 self.var = var
-                
-  
+                   
+
     def to_AnnData(self):
         """
         Takes the cunnData object and creates an AnnData object
@@ -100,9 +103,7 @@ class cunnData:
             self.X = self.X.tocsr()
             self.genes = self.genes[thr]
             self.genes = self.genes.reset_index(drop=True)
-            self.var = self.var.iloc[cp.asnumpy(thr)]
-                
-                
+            self.var = self.var.iloc[cp.asnumpy(thr)]       
         else:
             self.X =self.X.tocsc()
             thr = cp.diff(self.X.indptr).ravel()
@@ -347,3 +348,255 @@ class cunnData:
         Calculated the natural logarithm of one plus the sparse marttix, element-wise inlpace in cunnData object.
         """
         self.X = self.X.log1p()
+        self.uns = {}
+        self.uns["log1p"] = {"base": None}
+        
+    
+    def highly_varible_genes(self,min_mean = 0.0125,max_mean =3,min_disp= 0.5,max_disp =np.inf, n_top_genes = None, flavor = 'seurat', n_bins = 20):
+        """
+        Annotate highly variable genes. Expects logarithmized data. Reimplentation of scanpy's function. 
+        Depending on flavor, this reproduces the R-implementations of Seurat, Cell Ranger.
+        
+        For these dispersion-based methods, the normalized dispersion is obtained by scaling with the mean and standard deviation of the dispersions for genes falling into a given bin for mean expression of genes. This means that for each bin of mean expression, highly variable genes are selected.
+        
+        Todo:
+            Implement batchkey functionality.
+        
+        Parameters
+        ----------
+
+        min_mean: float (default: 0.0125)
+            If n_top_genes unequals None, this and all other cutoffs for the means and the normalized dispersions are ignored.
+        max_mean: float (default: 3)
+            If n_top_genes unequals None, this and all other cutoffs for the means and the normalized dispersions are ignored.
+        min_disp: float (default: 0.5)
+            If n_top_genes unequals None, this and all other cutoffs for the means and the normalized dispersions are ignored.
+        max_disp: float (default: inf)
+            If n_top_genes unequals None, this and all other cutoffs for the means and the normalized dispersions are ignored.
+        n_top_genes: int (defualt: None)
+            Number of highly-variable genes to keep.
+        n_bins : int (default: 20)
+            Number of bins for binning the mean gene expression. Normalization is done with respect to each bin. If just a single gene falls into a bin, the normalized dispersion is artificially set to 1. 
+        flavor : {‘seurat’, ‘cell_ranger’} (default: 'seurat')
+            Choose the flavor for identifying highly variable genes. For the dispersion based methods in their default workflows, Seurat passes the cutoffs whereas Cell Ranger passes n_top_genes.
+            
+        
+        Returns
+        -------
+        
+        upates .var with the following fields
+        highly_variablebool
+            boolean indicator of highly-variable genes
+
+        means
+            means per gene
+
+        dispersions
+            dispersions per gene
+
+        dispersions_norm
+            normalized dispersions per gene
+        
+        """
+        my_mat = self.X.tocsc()
+        if flavor == 'seurat':
+            my_mat = my_mat.expm1()
+        mean = (my_mat.sum(axis =0)/my_mat.shape[0]).ravel()
+        mean[mean == 0] = 1e-12
+        my_mat.data **= 2
+        inter = (my_mat.sum(axis =0)/my_mat.shape[0]).ravel()
+        var = inter - mean ** 2
+        disp = var/mean
+        if flavor == 'seurat':  # logarithmized mean as in Seurat
+            disp[disp == 0] = np.nan
+            disp = np.log(disp)
+            mean = np.log1p(mean)
+        df = pd.DataFrame()
+        mean = mean.get()
+        disp = disp.get()
+        df['means'] = mean
+        df['dispersions'] = disp
+        if flavor == 'seurat':
+            df['mean_bin'] = pd.cut(df['means'], bins=n_bins)
+            disp_grouped = df.groupby('mean_bin')['dispersions']
+            disp_mean_bin = disp_grouped.mean()
+            disp_std_bin = disp_grouped.std(ddof=1)
+            # retrieve those genes that have nan std, these are the ones where
+            # only a single gene fell in the bin and implicitly set them to have
+            # a normalized disperion of 1
+            one_gene_per_bin = disp_std_bin.isnull()
+            gen_indices = np.where(one_gene_per_bin[df['mean_bin'].values])[0].tolist()
+
+            # Circumvent pandas 0.23 bug. Both sides of the assignment have dtype==float32,
+            # but there’s still a dtype error without “.value”.
+            disp_std_bin[one_gene_per_bin.values] = disp_mean_bin[
+                one_gene_per_bin.values
+            ].values
+            disp_mean_bin[one_gene_per_bin.values] = 0
+            # actually do the normalization
+            df['dispersions_norm'] = (
+                df['dispersions'].values  # use values here as index differs
+                - disp_mean_bin[df['mean_bin'].values].values
+            ) / disp_std_bin[df['mean_bin'].values].values
+
+        elif flavor == 'cell_ranger':
+            from statsmodels import robust
+            df['mean_bin'] = pd.cut(
+                    df['means'],
+                    np.r_[-np.inf, np.percentile(df['means'], np.arange(10, 105, 5)), np.inf],
+                )
+            disp_grouped = df.groupby('mean_bin')['dispersions']
+            disp_median_bin = disp_grouped.median()
+            with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    disp_mad_bin = disp_grouped.apply(robust.mad)
+                    df['dispersions_norm'] = (
+                        df['dispersions'].values - disp_median_bin[df['mean_bin'].values].values
+                    ) / disp_mad_bin[df['mean_bin'].values].values
+
+        dispersion_norm = df['dispersions_norm'].values
+        if n_top_genes is not None:
+            dispersion_norm = dispersion_norm[~np.isnan(dispersion_norm)]
+            dispersion_norm[::-1].sort()# interestingly, np.argpartition is slightly slower
+            if n_top_genes > my_mat.shape[1]:
+                n_top_genes = my_mat.shape[1]
+            disp_cut_off = dispersion_norm[n_top_genes - 1]
+            gene_subset = np.nan_to_num(df['dispersions_norm'].values) >= disp_cut_off
+        else:
+            dispersion_norm[np.isnan(dispersion_norm)] = 0  # similar to Seurat
+            gene_subset = np.logical_and.reduce(
+                (
+                    mean > min_mean,
+                    mean < max_mean,
+                    dispersion_norm > min_disp,
+                    dispersion_norm < max_disp,
+                )
+            )
+
+        df['highly_variable'] = gene_subset
+        self.var["highly_variable"] =df['highly_variable'].values
+        self.var["means"] = df['means'].values
+        self.var["dispersions"]=df['dispersions'].values
+        self.var["dispersions_norm"]=df['dispersions_norm'].values
+        
+    def filter_highly_variable(self):
+        """
+        Filters the cunndata object for highly_variable genes. Run highly_varible_genes first.
+        
+        Returns
+        -------
+        
+        updates cunndata object to only contain highly variable genes.
+        
+        """
+        if "highly_variable" in self.var.keys():
+            thr = np.where(self.var["highly_variable"] == True)[0]
+            self.X =self.X.tocsc()
+            self.X = self.X[:, thr]
+            self.shape = self.X.shape
+            self.nnz = self.X.nnz
+            self.genes = self.genes[thr]
+            self.genes = self.genes.reset_index(drop=True)
+            self.var = self.var.iloc[cp.asnumpy(thr)]      
+        else:
+            print(f"Please calculate highly variable genes first")
+            
+    def regress_out(self, keys, verbose=False):
+
+        """
+        Use linear regression to adjust for the effects of unwanted noise
+        and variation. 
+        Parameters
+        ----------
+
+        adata
+            The annotated data matrix.
+        keys
+            Keys for numerical observation annotation on which to regress on.
+
+        verbose : bool
+            Print debugging information
+
+        Returns
+        -------
+        updates cunndata object with the corrected data matrix
+
+
+        """
+        
+        if type(self.X) is not cpx.scipy.sparse.csc.csc_matrix:
+            self.X = self.X.tocsc()
+
+        dim_regressor= 2
+        if type(keys)is list:
+            dim_regressor = len(keys)+1
+
+        regressors = cp.ones((self.X.shape[0]*dim_regressor)).reshape((self.X.shape[0], dim_regressor), order="F")
+        if dim_regressor==2:
+            regressors[:, 1] = cp.array(self.obs[keys]).ravel()
+        else:
+            for i in range(dim_regressor-1):
+                regressors[:, i+1] = cp.array(self.obs[keys[i]]).ravel()
+
+        outputs = cp.empty(self.X.shape, dtype=self.X.dtype, order="F")
+
+        for i in range(self.X.shape[1]):
+            if verbose and i % 500 == 0:
+                print("Regressed %s out of %s" %(i, self.X.shape[1]))
+            X = regressors
+            y = self.X[:,i]
+            outputs[:, i] = _regress_out_chunk(X, y)
+        self.X = outputs
+    
+    def scale(self, max_value=10):
+        """
+        Scales matrix to unit variance and clips values
+
+        Parameters
+        ----------
+
+        normalized : cupy.ndarray or numpy.ndarray of shape (n_cells, n_genes)
+                     Matrix to scale
+        max_value : int
+                    After scaling matrix to unit variance,
+                    values will be clipped to this number
+                    of std deviations.
+
+        Return
+        ------
+        updates cunndata object with a scaled cunndata.X
+        """
+        X = cp.asarray(self.X)
+        mean = X.mean(axis=0)
+        X -= mean
+        del mean
+        stddev = cp.sqrt(X.var(axis=0))
+        X /= stddev
+        del stddev
+        self.X = X.clip(a_max=max_value)
+    
+def _regress_out_chunk(X, y):
+    """
+    Performs a data_cunk.shape[1] number of local linear regressions,
+    replacing the data in the original chunk w/ the regressed result.
+
+    Parameters
+    ----------
+
+    X : cupy.ndarray of shape (n_cells, 3)
+        Matrix of regressors
+
+    y : cupy.sparse.spmatrix of shape (n_cells,)
+        Sparse matrix containing a single column of the cellxgene matrix
+
+    Returns
+    -------
+
+    dense_mat : cupy.ndarray of shape (n_cells,)
+        Adjusted column
+    """
+    y_d = y.todense()
+
+    lr = LinearRegression(fit_intercept=False, output_type="cupy")
+    lr.fit(X, y_d, convert_dtype=True)
+    return y_d.reshape(y_d.shape[0],) - lr.predict(X).reshape(y_d.shape[0])

@@ -37,120 +37,6 @@ from cuml.linear_model import LinearRegression
 
 
     
-def scale(normalized, max_value=10):
-    """
-    Scales matrix to unit variance and clips values
-
-    Parameters
-    ----------
-
-    normalized : cupy.ndarray or numpy.ndarray of shape (n_cells, n_genes)
-                 Matrix to scale
-    max_value : int
-                After scaling matrix to unit variance,
-                values will be clipped to this number
-                of std deviations.
-
-    Return
-    ------
-
-    normalized : cupy.ndarray of shape (n_cells, n_genes)
-        Dense normalized matrix
-    """
-
-    normalized = cp.asarray(normalized)
-    mean = normalized.mean(axis=0)
-    normalized -= mean
-    del mean
-    stddev = cp.sqrt(normalized.var(axis=0))
-    normalized /= stddev
-    del stddev
-    
-    return normalized.clip(a_max=max_value)
-
-    
-    
-    
-def _regress_out_chunk(X, y):
-    """
-    Performs a data_cunk.shape[1] number of local linear regressions,
-    replacing the data in the original chunk w/ the regressed result.
-
-    Parameters
-    ----------
-
-    X : cupy.ndarray of shape (n_cells, 3)
-        Matrix of regressors
-
-    y : cupy.sparse.spmatrix of shape (n_cells,)
-        Sparse matrix containing a single column of the cellxgene matrix
-
-    Returns
-    -------
-
-    dense_mat : cupy.ndarray of shape (n_cells,)
-        Adjusted column
-    """
-    y_d = y.todense()
-    
-    lr = LinearRegression(fit_intercept=False, output_type="cupy")
-    lr.fit(X, y_d, convert_dtype=True)
-    return y_d.reshape(y_d.shape[0],) - lr.predict(X).reshape(y_d.shape[0])
-    
-
-
-
-def regress_out(adata, keys, verbose=False):
-
-    """
-    Use linear regression to adjust for the effects of unwanted noise
-    and variation. 
-    Parameters
-    ----------
-
-    adata
-        The annotated data matrix.
-    keys
-        Keys for numerical observation annotation on which to regress on.
-
-    verbose : bool
-        Print debugging information
-
-    Returns
-    -------
-    outputs : cupy.ndarray
-        Adjusted dense matrix
-    
-    """
-    
-    normalized = cp.sparse.csc_matrix(adata.X)
-    
-    dim_regressor= 2
-    if type(keys)is list:
-        dim_regressor = len(keys)+1
-    
-    regressors = cp.ones((adata.n_obs*dim_regressor)).reshape((adata.n_obs, dim_regressor), order="F")
-    if dim_regressor==2:
-        regressors[:, 1] = cp.array(adata.obs[keys]).ravel()
-    else:
-        for i in range(dim_regressor-1):
-            regressors[:, i+1] = cp.array(adata.obs[keys[i]]).ravel()
-    
-    outputs = cp.empty(normalized.shape, dtype=normalized.dtype, order="F")
-    
-    for i in range(normalized.shape[1]):
-        if verbose and i % 500 == 0:
-            print("Regressed %s out of %s" %(i, normalized.shape[1]))
-        X = regressors
-        y = normalized[:,i]
-        outputs[:, i] = _regress_out_chunk(X, y)
-    return outputs
-    
-
-
-
-
-
 def select_groups(labels, groups_order_subset='all'):
     adata_obs_key = labels
     groups_order = labels.cat.categories
@@ -247,11 +133,13 @@ def rank_genes_groups(
         and reference not in set(labels.cat.categories)
     ):
         cats = labels.cat.categories.tolist()
+        
         raise ValueError(
             f'reference = {reference} needs to be one of groupby = {cats}.'
         )
 
     groups_order, groups_masks = select_groups(labels, groups_order)
+
     
     original_reference = reference
     
@@ -269,10 +157,12 @@ def rank_genes_groups(
     ns = cp.zeros(n_groups, dtype=int)
     for imask, mask in enumerate(groups_masks):
         ns[imask] = cp.where(mask)[0].size
+    
     if reference != 'rest':
         ireference = cp.where(groups_order == reference)[0][0]
     reference_indices = cp.arange(n_vars, dtype=int)
 
+    
     rankings_gene_scores = []
     rankings_gene_names = []
 
@@ -282,12 +172,15 @@ def rank_genes_groups(
     # if reference is set, then the groups listed will be compared only to the other groups listed
     from cuml.linear_model import LogisticRegression
     reference = groups_order[0]
+    
     if len(groups) == 1:
         raise Exception('Cannot perform logistic regression on a single cluster.')
-    grouping_mask = labels.astype('int').isin(cudf.Series(groups_order))
+    
+    grouping_mask = labels.astype('int').isin(cudf.Series(groups_order).astype('int'))
+    
     grouping = labels.loc[grouping_mask]
     
-    X = X[grouping_mask.values, :]  # Indexing with a series causes issues, possibly segfault
+    X = X[grouping_mask.values, :]# Indexing with a series causes issues, possibly segfault
     y = labels.loc[grouping]
     
     clf = LogisticRegression(**kwds)
@@ -344,7 +237,7 @@ def leiden(adata, resolution=1.0):
         Higher values lead to more clusters.
     """
     # Adjacency graph
-    adjacency = adata.uns['neighbors']['connectivities']
+    adjacency = adata.obsp["connectivities"]
     offsets = cudf.Series(adjacency.indptr)
     indices = cudf.Series(adjacency.indices)
     g = cugraph.Graph()
