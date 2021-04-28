@@ -255,6 +255,36 @@ def leiden(adata, resolution=1.0):
     
     adata.obs['leiden'] = clusters
     
+def louvain(adata, resolution=1.0):
+    """
+    Performs Louvain Clustering using cuGraph
+    Parameters
+    ----------
+    adata : annData object with 'neighbors' field.
+       
+    resolution : float, optional (default: 1)
+        A parameter value controlling the coarseness of the clustering.
+        Higher values lead to more clusters.
+    """
+    # Adjacency graph
+    adjacency = adata.obsp["connectivities"]
+    offsets = cudf.Series(adjacency.indptr)
+    indices = cudf.Series(adjacency.indices)
+    g = cugraph.Graph()
+    if hasattr(g, 'add_adj_list'):
+        g.add_adj_list(offsets, indices, None)
+    else:
+        g.from_cudf_adjlist(offsets, indices, None)
+    
+    # Cluster
+    louvain_parts, _ = cugraph.louvain(g,resolution = resolution)
+    
+    # Format output
+    clusters = louvain_parts.to_pandas().sort_values('vertex')[['partition']].to_numpy().ravel()
+    clusters = pd.Categorical(clusters)
+    
+    adata.obs['louvain'] = clusters 
+    
 def kmeans(adata, n_clusters =8, random_state= 42):
     """
     KMeans is a basic but powerful clustering method which is optimized via

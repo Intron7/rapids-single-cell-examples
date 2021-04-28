@@ -24,6 +24,7 @@ class cunnData:
     shape = tuple
     nnz = int
     genes = cudf.Series
+    uns = {}
     def __init__(
         self,
         X: Optional[Union[np.ndarray,sparse.spmatrix, cp.array, cp.sparse.csr_matrix]] = None,
@@ -36,7 +37,9 @@ class cunnData:
                 self.nnz = self.X.nnz
                 self.genes = cudf.Series(adata.var_names)
                 self.obs = adata.obs.copy()
-                self.var = adata.var.copy()  
+                self.var = adata.var.copy()
+                self.uns = adata.uns.copy()
+                
             else:
                 self.X = cp.sparse.csr_matrix(X)
                 self.shape = self.X.shape
@@ -348,19 +351,15 @@ class cunnData:
         Calculated the natural logarithm of one plus the sparse marttix, element-wise inlpace in cunnData object.
         """
         self.X = self.X.log1p()
-        self.uns = {}
         self.uns["log1p"] = {"base": None}
         
     
-    def highly_varible_genes(self,min_mean = 0.0125,max_mean =3,min_disp= 0.5,max_disp =np.inf, n_top_genes = None, flavor = 'seurat', n_bins = 20):
+    def highly_varible_genes(self,min_mean = 0.0125,max_mean =3,min_disp= 0.5,max_disp =np.inf, n_top_genes = None, flavor = 'seurat', n_bins = 20, batch_key = None):
         """
         Annotate highly variable genes. Expects logarithmized data. Reimplentation of scanpy's function. 
         Depending on flavor, this reproduces the R-implementations of Seurat, Cell Ranger.
         
         For these dispersion-based methods, the normalized dispersion is obtained by scaling with the mean and standard deviation of the dispersions for genes falling into a given bin for mean expression of genes. This means that for each bin of mean expression, highly variable genes are selected.
-        
-        Todo:
-            Implement batchkey functionality.
         
         Parameters
         ----------
@@ -379,6 +378,8 @@ class cunnData:
             Number of bins for binning the mean gene expression. Normalization is done with respect to each bin. If just a single gene falls into a bin, the normalized dispersion is artificially set to 1. 
         flavor : {‘seurat’, ‘cell_ranger’} (default: 'seurat')
             Choose the flavor for identifying highly variable genes. For the dispersion based methods in their default workflows, Seurat passes the cutoffs whereas Cell Ranger passes n_top_genes.
+        batch_key:
+            If specified, highly-variable genes are selected within each batch separately and merged.
             
         
         Returns
@@ -398,86 +399,107 @@ class cunnData:
             normalized dispersions per gene
         
         """
-        my_mat = self.X.tocsc()
-        if flavor == 'seurat':
-            my_mat = my_mat.expm1()
-        mean = (my_mat.sum(axis =0)/my_mat.shape[0]).ravel()
-        mean[mean == 0] = 1e-12
-        my_mat.data **= 2
-        inter = (my_mat.sum(axis =0)/my_mat.shape[0]).ravel()
-        var = inter - mean ** 2
-        disp = var/mean
-        if flavor == 'seurat':  # logarithmized mean as in Seurat
-            disp[disp == 0] = np.nan
-            disp = np.log(disp)
-            mean = np.log1p(mean)
-        df = pd.DataFrame()
-        mean = mean.get()
-        disp = disp.get()
-        df['means'] = mean
-        df['dispersions'] = disp
-        if flavor == 'seurat':
-            df['mean_bin'] = pd.cut(df['means'], bins=n_bins)
-            disp_grouped = df.groupby('mean_bin')['dispersions']
-            disp_mean_bin = disp_grouped.mean()
-            disp_std_bin = disp_grouped.std(ddof=1)
-            # retrieve those genes that have nan std, these are the ones where
-            # only a single gene fell in the bin and implicitly set them to have
-            # a normalized disperion of 1
-            one_gene_per_bin = disp_std_bin.isnull()
-            gen_indices = np.where(one_gene_per_bin[df['mean_bin'].values])[0].tolist()
-
-            # Circumvent pandas 0.23 bug. Both sides of the assignment have dtype==float32,
-            # but there’s still a dtype error without “.value”.
-            disp_std_bin[one_gene_per_bin.values] = disp_mean_bin[
-                one_gene_per_bin.values
-            ].values
-            disp_mean_bin[one_gene_per_bin.values] = 0
-            # actually do the normalization
-            df['dispersions_norm'] = (
-                df['dispersions'].values  # use values here as index differs
-                - disp_mean_bin[df['mean_bin'].values].values
-            ) / disp_std_bin[df['mean_bin'].values].values
-
-        elif flavor == 'cell_ranger':
-            from statsmodels import robust
-            df['mean_bin'] = pd.cut(
-                    df['means'],
-                    np.r_[-np.inf, np.percentile(df['means'], np.arange(10, 105, 5)), np.inf],
-                )
-            disp_grouped = df.groupby('mean_bin')['dispersions']
-            disp_median_bin = disp_grouped.median()
-            with warnings.catch_warnings():
-                    warnings.simplefilter('ignore')
-                    disp_mad_bin = disp_grouped.apply(robust.mad)
-                    df['dispersions_norm'] = (
-                        df['dispersions'].values - disp_median_bin[df['mean_bin'].values].values
-                    ) / disp_mad_bin[df['mean_bin'].values].values
-
-        dispersion_norm = df['dispersions_norm'].values
-        if n_top_genes is not None:
-            dispersion_norm = dispersion_norm[~np.isnan(dispersion_norm)]
-            dispersion_norm[::-1].sort()# interestingly, np.argpartition is slightly slower
-            if n_top_genes > my_mat.shape[1]:
-                n_top_genes = my_mat.shape[1]
-            disp_cut_off = dispersion_norm[n_top_genes - 1]
-            gene_subset = np.nan_to_num(df['dispersions_norm'].values) >= disp_cut_off
+        if batch_key is None:
+            df = _highly_variable_genes_single_batch(
+                self.X.tocsc(),
+                min_disp=min_disp,
+                max_disp=max_disp,
+                min_mean=min_mean,
+                max_mean=max_mean,
+                n_top_genes=n_top_genes,
+                n_bins=n_bins,
+                flavor=flavor)
         else:
-            dispersion_norm[np.isnan(dispersion_norm)] = 0  # similar to Seurat
-            gene_subset = np.logical_and.reduce(
-                (
-                    mean > min_mean,
-                    mean < max_mean,
-                    dispersion_norm > min_disp,
-                    dispersion_norm < max_disp,
+            self.obs[batch_key].astype("category")
+            batches = self.obs[batch_key].cat.categories
+            df = []
+            genes = self.genes.to_array()
+            for batch in batches:
+                inter_matrix = self.X[np.where(self.obs[batch_key]==batch)[0],].tocsc()
+                thr_org = cp.diff(inter_matrix.indptr).ravel()
+                thr = cp.where(thr_org >= 1)[0]
+                thr_2 = cp.where(thr_org < 1)[0]
+                inter_matrix = inter_matrix[:, thr]
+                thr = thr.get()
+                thr_2 = thr_2.get()
+                inter_genes = genes[thr]
+                other_gens_inter = genes[thr_2]
+                hvg_inter = _highly_variable_genes_single_batch(inter_matrix,
+                                                                min_disp=min_disp,
+                                                                max_disp=max_disp,
+                                                                min_mean=min_mean,
+                                                                max_mean=max_mean,
+                                                                n_top_genes=n_top_genes,
+                                                                n_bins=n_bins,
+                                                                flavor=flavor)
+                hvg_inter["gene"] = inter_genes
+                missing_hvg = pd.DataFrame(
+                    np.zeros((len(other_gens_inter), len(hvg_inter.columns))),
+                    columns=hvg_inter.columns,
+                )
+                missing_hvg['highly_variable'] = missing_hvg['highly_variable'].astype(bool)
+                missing_hvg['gene'] = other_gens_inter
+                hvg = hvg_inter.append(missing_hvg, ignore_index=True)
+                idxs = np.concatenate((thr, thr_2))
+                hvg = hvg.loc[np.argsort(idxs)]
+                df.append(hvg)
+            
+            df = pd.concat(df, axis=0)
+            df['highly_variable'] = df['highly_variable'].astype(int)
+            df = df.groupby('gene').agg(
+                dict(
+                    means=np.nanmean,
+                    dispersions=np.nanmean,
+                    dispersions_norm=np.nanmean,
+                    highly_variable=np.nansum,
                 )
             )
-
-        df['highly_variable'] = gene_subset
+            df.rename(
+                columns=dict(highly_variable='highly_variable_nbatches'), inplace=True
+            )
+            df['highly_variable_intersection'] = df['highly_variable_nbatches'] == len(
+                batches
+            )
+            if n_top_genes is not None:
+                # sort genes by how often they selected as hvg within each batch and
+                # break ties with normalized dispersion across batches
+                df.sort_values(
+                    ['highly_variable_nbatches', 'dispersions_norm'],
+                    ascending=False,
+                    na_position='last',
+                    inplace=True,
+                )
+                df['highly_variable'] = False
+                df.highly_variable.iloc[:n_top_genes] = True
+                df = df.loc[genes]
+            else:
+                df = df.loc[genes]
+                dispersion_norm = df.dispersions_norm.values
+                dispersion_norm[np.isnan(dispersion_norm)] = 0  # similar to Seurat
+                gene_subset = np.logical_and.reduce(
+                    (
+                        df.means > min_mean,
+                        df.means < max_mean,
+                        df.dispersions_norm > min_disp,
+                        df.dispersions_norm < max_disp,
+                    )
+                )
+                df['highly_variable'] = gene_subset
+        
         self.var["highly_variable"] =df['highly_variable'].values
         self.var["means"] = df['means'].values
         self.var["dispersions"]=df['dispersions'].values
         self.var["dispersions_norm"]=df['dispersions_norm'].values
+        self.uns['hvg'] = {'flavor': flavor}
+        if batch_key is not None:
+            self.var['highly_variable_nbatches'] = df[
+                'highly_variable_nbatches'
+            ].values
+            self.var['highly_variable_intersection'] = df[
+                'highly_variable_intersection'
+            ].values
+    
+
         
     def filter_highly_variable(self):
         """
@@ -600,3 +622,88 @@ def _regress_out_chunk(X, y):
     lr = LinearRegression(fit_intercept=False, output_type="cupy")
     lr.fit(X, y_d, convert_dtype=True)
     return y_d.reshape(y_d.shape[0],) - lr.predict(X).reshape(y_d.shape[0])
+
+def _highly_variable_genes_single_batch(my_mat,min_mean = 0.0125,max_mean =3,min_disp= 0.5,max_disp =np.inf, n_top_genes = None, flavor = 'seurat', n_bins = 20):
+        """\
+        See `highly_variable_genes`.
+        Returns
+        -------
+        A DataFrame that contains the columns
+        `highly_variable`, `means`, `dispersions`, and `dispersions_norm`.
+        """
+        if flavor == 'seurat':
+            my_mat = my_mat.expm1()
+        mean = (my_mat.sum(axis =0)/my_mat.shape[0]).ravel()
+        mean[mean == 0] = 1e-12
+        my_mat.data **= 2
+        inter = (my_mat.sum(axis =0)/my_mat.shape[0]).ravel()
+        var = inter - mean ** 2
+        disp = var/mean
+        if flavor == 'seurat':  # logarithmized mean as in Seurat
+            disp[disp == 0] = np.nan
+            disp = np.log(disp)
+            mean = np.log1p(mean)
+        df = pd.DataFrame()
+        mean = mean.get()
+        disp = disp.get()
+        df['means'] = mean
+        df['dispersions'] = disp
+        if flavor == 'seurat':
+            df['mean_bin'] = pd.cut(df['means'], bins=n_bins)
+            disp_grouped = df.groupby('mean_bin')['dispersions']
+            disp_mean_bin = disp_grouped.mean()
+            disp_std_bin = disp_grouped.std(ddof=1)
+            # retrieve those genes that have nan std, these are the ones where
+            # only a single gene fell in the bin and implicitly set them to have
+            # a normalized disperion of 1
+            one_gene_per_bin = disp_std_bin.isnull()
+            gen_indices = np.where(one_gene_per_bin[df['mean_bin'].values])[0].tolist()
+
+            # Circumvent pandas 0.23 bug. Both sides of the assignment have dtype==float32,
+            # but there’s still a dtype error without “.value”.
+            disp_std_bin[one_gene_per_bin.values] = disp_mean_bin[
+                one_gene_per_bin.values
+            ].values
+            disp_mean_bin[one_gene_per_bin.values] = 0
+            # actually do the normalization
+            df['dispersions_norm'] = (
+                df['dispersions'].values  # use values here as index differs
+                - disp_mean_bin[df['mean_bin'].values].values
+            ) / disp_std_bin[df['mean_bin'].values].values
+
+        elif flavor == 'cell_ranger':
+            from statsmodels import robust
+            df['mean_bin'] = pd.cut(
+                    df['means'],
+                    np.r_[-np.inf, np.percentile(df['means'], np.arange(10, 105, 5)), np.inf],
+                )
+            disp_grouped = df.groupby('mean_bin')['dispersions']
+            disp_median_bin = disp_grouped.median()
+            with warnings.catch_warnings():
+                    warnings.simplefilter('ignore')
+                    disp_mad_bin = disp_grouped.apply(robust.mad)
+                    df['dispersions_norm'] = (
+                        df['dispersions'].values - disp_median_bin[df['mean_bin'].values].values
+                    ) / disp_mad_bin[df['mean_bin'].values].values
+
+        dispersion_norm = df['dispersions_norm'].values
+        if n_top_genes is not None:
+            dispersion_norm = dispersion_norm[~np.isnan(dispersion_norm)]
+            dispersion_norm[::-1].sort()# interestingly, np.argpartition is slightly slower
+            if n_top_genes > my_mat.shape[1]:
+                n_top_genes = my_mat.shape[1]
+            disp_cut_off = dispersion_norm[n_top_genes - 1]
+            gene_subset = np.nan_to_num(df['dispersions_norm'].values) >= disp_cut_off
+        else:
+            dispersion_norm[np.isnan(dispersion_norm)] = 0  # similar to Seurat
+            gene_subset = np.logical_and.reduce(
+                (
+                    mean > min_mean,
+                    mean < max_mean,
+                    dispersion_norm > min_disp,
+                    dispersion_norm < max_disp,
+                )
+            )
+
+        df['highly_variable'] = gene_subset
+        return df
