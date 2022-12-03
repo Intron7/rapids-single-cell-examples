@@ -8,13 +8,15 @@ dependencies:
   - umap-learn
   - cmake
   - jupyterlab
+  - scanpy=1.9.1
   - wget
+  - python-igraph
+  - leidenalg
+  - cmake=3.13*
   - pip
   - pip:
       - jupyter-server-proxy
-      - scanpy==1.7.0rc1
       - python-igraph
       - louvain
-      - leidenalg
       - MulticoreTSNE
       - pynndescent

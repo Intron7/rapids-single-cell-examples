@@ -46,14 +46,14 @@ main_fig_height = 700
 
 class Visualization:
 
-    def __init__(self, adata, markers,
+    def __init__(self, adata, markers=[],
                  re_cluster_callback=None,
                  n_components=50,
                  n_neighbors=50,
                  knn_n_pcs=50,
                  umap_min_dist = 0.3,
                  umap_spread = 1.0,
-                 louvain_resolution = 0.4):
+                 leiden_resolution = 0.4):
 
         self.app = dash.Dash(__name__, external_stylesheets=external_stylesheets)
         self.adata = adata
@@ -67,7 +67,7 @@ class Visualization:
         self.knn_n_pcs = knn_n_pcs
         self.umap_min_dist = umap_min_dist
         self.umap_spread = umap_spread
-        self.louvain_resolution = louvain_resolution
+        self.leiden_resolution = leiden_resolution
 
         if re_cluster_callback:
             self.re_cluster_func = re_cluster_callback
@@ -120,7 +120,7 @@ class Visualization:
         adata_copy.obsm["X_pca"] = PCA(n_components=self.n_components, output_type="numpy").fit_transform(adata_copy.X)
         sc.pp.neighbors(adata_copy, n_neighbors=self.n_neighbors, n_pcs=self.knn_n_pcs, method='rapids')
         sc.tl.umap(adata_copy, min_dist=self.umap_min_dist, spread=self.umap_spread, method='rapids')
-        sc.tl.louvain(adata_copy, flavor='rapids', resolution=self.louvain_resolution)
+        adata.obs['leiden'] = rapids_scanpy_funcs.leiden(adata, resolution=self.louvain_resolution)
         return adata_copy
 
     def reset(self):
@@ -135,7 +135,7 @@ class Visualization:
         #)
         df = cudf.DataFrame(l_adata.obsm["X_umap"], columns=["x", "y"])
 
-        ldf = cudf.Series(l_adata.obs["louvain"].values)
+        ldf = cudf.Series(l_adata.obs["leiden"].values)
         df["labels"] = ldf.astype('int32')
         for marker in self.markers:
             df[marker] = cudf.Series(l_adata.obs[marker + "_raw"].values)
@@ -154,7 +154,7 @@ class Visualization:
         violins = self.update_violin_plot(self.tdf)
 
         col_classes = {1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five', 6: 'six', 7: 'seven', 8: 'eight'}
-        col_class = col_classes[12 / len(violins)]
+        col_class = col_classes[12 / len(violins)] if len(violins) > 0 else None
         divs_violin = []
         for i in range(0, len(violins)):
             divs_violin.append(
@@ -261,10 +261,10 @@ class Visualization:
             gdf = df.query(query)
             fig.add_trace(
                 go.Scattergl({
-                'x': gdf['x'].to_array(),
-                'y': gdf['y'].to_array(),
-                'text': gdf['labels'].to_array(),
-                'customdata': gdf['point_index'].to_array(),
+                'x': gdf['x'].to_numpy(),
+                'y': gdf['y'].to_numpy(),
+                'text': gdf['labels'].to_numpy(),
+                'customdata': gdf['point_index'].to_numpy(),
                 'name': 'Cluster ' + si,
                 'mode': 'markers',
                 'marker': {'size': 3, 'color': colors[i % len(colors)]}
@@ -286,10 +286,10 @@ class Visualization:
             gdf = df.query(query)
             fig = {
                 'type':'scattergl',
-                'x': gdf['x'].to_array(),
-                'y': gdf['y'].to_array(),
-                'text': gdf['labels'].to_array(),
-                'customdata': gdf['point_index'].to_array(),
+                'x': gdf['x'].to_numpy(),
+                'y': gdf['y'].to_numpy(),
+                'text': gdf['labels'].to_numpy(),
+                'customdata': gdf['point_index'].to_numpy(),
                 'name': 'Cluster ' + si,
                 'mode': 'markers',
                 'marker': {'size': 3, 'color': colors[i % len(colors)]}        }
@@ -341,7 +341,7 @@ class Visualization:
             query = 'labels == ' + si
             gdf = df.query(query)
 
-            y = gdf[marker_val].to_array()
+            y = gdf[marker_val].to_numpy()
             x = [i] * len(y)
             fig.add_trace(
                 go.Violin({
@@ -362,7 +362,7 @@ class Visualization:
         self.reset()
 
         return self.app.run_server(
-            debug=True, use_reloader=False, host=host, port=port)
+            debug=False, use_reloader=False, host=host, port=port)
 
     def reset_dialog(self, n_clicks):
         if not dash.callback_context.triggered:
